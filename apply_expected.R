@@ -15,7 +15,7 @@ sql1 <-
   when cast(age as int)  < 75 then '65-74'
   else '75+' end as Age_grp,
   sum(Total_Patients) as patients,
-  sum(Total_MalePatients) as males_patients,
+  sum(Total_MalePatients) as male_patients,
   sum(Total_FemalePatients) as female_patients
   from [Reference].[vwPop_GPPractice_Patient_SYOA_Pivotted]
   where (Age = '95+' or Age > 15 )
@@ -48,15 +48,35 @@ hse_estimate <-
   hse_estimate |> 
   filter(Group == 'All with hypertension') |> 
   select(-Group) |> 
-  pivot_longer(-Sex, values_to = "patients", names_transform = as.character, names_to = "Age_grp")
+  pivot_longer(-Sex, values_to = "exp_perc", values_transform = function(x) x/100,
+               names_transform = as.character, names_to = "Age_grp") |> 
+  filter(Sex != "Adults") |> 
+  mutate(Sex = ifelse(Sex == "Men", "male", "female"))
 
 
-
-practice_figures <-
+# JOin together and calcuate predicted numbers by aplying percentage to list groups
+practice_age_sex_figures <-
   list_size |> 
-  select(-)
-  pivot_longer()
-  inner_join(hse_estimate)
+  pivot_longer(cols = c(patients, male_patients, female_patients)
+               , names_to = "Sex", values_to = "Patients") |> 
+  filter(Sex != "patients") |> 
+  mutate(Sex = ifelse(Sex == "male_patients", "male", "female")) |> 
+  inner_join(hse_estimate) |> 
+  mutate(expected_patients = Patients * exp_perc)
+
+#Sum up groups to practice level
+practice_figures <-
+  practice_age_sex_figures |> 
+  group_by(GPPracticeCode_Current, GPPracticeName_Current) |> 
+  summarise(List_size = sum(Patients),
+         expected_patients = sum(expected_patients)) |> 
+  filter(GPPracticeCode_Current != 'Y01057') # Exclude Homeless Health Exchange, as no QOF
+
+# Check the list size sum is the same faster join
+list_size |> 
+  group_by(GPPracticeCode_Current, GPPracticeName_Current) |> 
+  summarise(sum(patients))
+
 
 # Get recent reported prevalence
 sql2 <-
@@ -79,3 +99,29 @@ sql2 <-
 
 reported_prev <- 
   dbGetQuery(con, sql2)
+
+
+# Temp table to plot
+tmp_figs <- 
+  practice_figures |> 
+  left_join(reported_prev, by = c("GPPracticeCode_Current" = "GPPracticeCode_Original"))
+
+
+library(FunnelPlotR)
+
+hyp_funnel <-
+  funnel_plot(tmp_figs, DiseaseRegisterSize, expected_patients, GPPracticeName_Current
+              , data_type = "RC", draw_adjusted = TRUE
+              , draw_unadjusted = FALSE
+              , title = "Ratio of QOF prevelence to predicted prevalence of hypertension"
+              , x_label = "Expected Prevalence"
+              , y_label = "QOF prevelence / Expected Prevalence"
+            )
+
+hyp_funnel$plot +
+  geom_hline(col = "red", yintercept=0.666666666) +
+  annotate("text", x = 8500, y = 0.7, label = "National average", colour="red") +
+  labs(subtitle = "Expected prevaelence based on age and sex-adjusted national data")
+
+tmp_figs$expected_patients
+tmp_figs$DiseaseRegisterSize
